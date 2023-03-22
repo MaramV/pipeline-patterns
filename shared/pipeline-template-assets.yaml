@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CodePipeline for deploying API Projects to API Gateway and Lambda.
+
+Parameters:
+  pGithubAccount:
+    Type: String
+    Default: orientaltrading
+    Description: The GitHub account name
+  pRepo:
+    Type: String
+    Default: otc-infra
+    Description: The CodeCommit Repository name
+  pRepoSecond:
+    Type: String
+    Default: fun365
+    Description: A potential secondary Repository
+  pRepoThird:
+    Type: String
+    Default: blank
+    Description: A potential third Repository
+  pBranch:
+    Type: String
+    Default: development
+    Description: The branch name to use in the repository
+  pBranchSecond:
+    Type: String
+    Default: PRODUCTION
+    Description: The branch name to use in the repository
+  pGitHubConnection:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The Arn for the GitHub/Pipeline connection resource
+    Default: /github/connection
+  pTopicArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The SNS Topic for CodePipeline notifications
+    Default: /otc/sns/pipeline
+  pTopicFailedArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The SNS Topic for CodePipeline failure notifications
+    Default: /otc/sns/pipelineFailed
+
+  pAppName:
+    Type: String
+    Description: Small descriptive name of the application for prefixes, resource names, and tagging values.  Lower case only.
+    Default: otc
+
+  pMapTag:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The map migration server tag value
+    Default: /map/server
+
+  pArtifactBucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The S3 Bucket for storing build ArtifactStore
+    Default: /otc/s3/artifact
+  pKeyArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The KMS Key
+    Default: /otc/kms/key
+  pCodeBuildImage:
+    Type: String
+    Description: The Container Image for CodeBuild resource
+    Default: "aws/codebuild/standard:5.0"
+
+  pVpcId:
+    Type: String
+    Default: vpc-036f11c38d61ace59
+    Description: VPC Id for CodeBuild Resources
+  pSubnetA:
+    Type: String
+    Default: subnet-0ed05aefa8d9e0181
+    Description: Private Subnet A for CodeBuild resources
+  pSubnetB:
+    Type: String
+    Default: subnet-03d9bfb2d3dc29359
+    Description: Private Subnet B for CodeBuild resources
+  pSecGroup:
+    Type: String
+    Default: sg-0eb226c313463df51
+    Description: Security Group for CodeBuild resources
+
+Conditions:
+  cHasSecondRepo: !Not [ !Equals [ !Ref pRepoSecond, "blank" ] ]
+  cHasThirdRepo: !Not [ !Equals [ !Ref pRepoThird, "blank" ] ]
+
+Resources:
+  rCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${pAppName}-${pRepo}-codebuild-${pBranch}"
+      ServiceRole: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${pAppName}-codebuild-role"
+      Artifacts:
+        Type: CODEPIPELINE
+        OverrideArtifactName: True
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: !Ref pCodeBuildImage
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: APP_NAME
+            Value: !Ref pAppName
+          - Name: PACKAGE_BUCKET
+            Value: !Ref pArtifactBucket
+          - Name: GITHUB_REPO
+            Value: !Ref pRepo
+          - Name: GITHUB_BRANCH
+            Value: !Ref pBranch
+      EncryptionKey: !Ref pKeyArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: cicd/buildspec.yaml
+      TimeoutInMinutes: 10
+      VpcConfig:
+        VpcId: !Ref pVpcId
+        Subnets:
+          - !Ref pSubnetA
+          - !Ref pSubnetB
+        SecurityGroupIds:
+          - !Ref pSecGroup
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${pAppName}-${pRepo}-pipeline-${pBranch}"
+      RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${pAppName}-codepipeline-role"
+      Tags:
+        - Key: Application
+          Value: !Ref pAppName
+        - Key: Repository
+          Value: !Ref pRepo
+        - Key: Branch
+          Value: !Ref pBranch
+        - Key: map-migrated
+          Value: !Ref pMapTag
+      ArtifactStore:
+        Type: S3
+        Location: !Ref pArtifactBucket
+        EncryptionKey:
+          Id: !Ref pKeyArn
+          Type: KMS
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: get-assets-build-scripts
+              InputArtifacts: []
+              OutputArtifacts:
+                - Name: !Sub "${pAppName}_AssetScript"
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                S3Bucket: 969702943927-codebuild
+                S3ObjectKey: assets_build.zip
+              RunOrder: 1
+            - Name: get-source-code
+              InputArtifacts: []
+              OutputArtifacts:
+                - Name: !Sub "${pAppName}_SourceArtifact"
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref pGitHubConnection
+                FullRepositoryId: !Sub "${pGithubAccount}/${pRepo}"
+                BranchName: !Ref pBranch
+                OutputArtifactFormat: CODEBUILD_CLONE_REF
+              RunOrder: 1
+            - !If
+              - cHasSecondRepo
+              - Name: get-source-code-second
+                InputArtifacts: []
+                OutputArtifacts:
+                  - Name: !Sub "${pAppName}_SourceArtifact2"
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Provider: CodeStarSourceConnection
+                  Version: "1"
+                Configuration:
+                  ConnectionArn: !Ref pGitHubConnection
+                  FullRepositoryId: !Sub "${pGithubAccount}/${pRepoSecond}"
+                  BranchName: !Ref pBranchSecond
+                  OutputArtifactFormat: CODEBUILD_CLONE_REF
+                RunOrder: 2
+              - !Ref AWS::NoValue
+            - !If
+              - cHasThirdRepo
+              - Name: get-source-code-third
+                InputArtifacts: []
+                OutputArtifacts:
+                  - Name: !Sub "${pAppName}_SourceArtifact3"
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Provider: CodeStarSourceConnection
+                  Version: "1"
+                Configuration:
+                  ConnectionArn: !Ref pGitHubConnection
+                  FullRepositoryId: !Sub "${pGithubAccount}/${pRepoThird}"
+                  BranchName: !Ref pBranch
+                  OutputArtifactFormat: CODEBUILD_CLONE_REF
+                RunOrder: 1
+              - !Ref AWS::NoValue
+        - Name: Build
+          Actions:
+            - Name: build-from-source
+              InputArtifacts:
+                - Name: !Sub "${pAppName}_AssetScript"
+                - Name: !Sub "${pAppName}_SourceArtifact"
+                - !If
+                  - cHasSecondRepo
+                  - Name: !Sub "${pAppName}_SourceArtifact2"
+                  - !Ref AWS::NoValue
+                - !If
+                  - cHasThirdRepo
+                  - Name: !Sub "${pAppName}_SourceArtifact3"
+                  - !Ref AWS::NoValue
+              OutputArtifacts:
+                - Name: !Sub "${pAppName}_BuildArtifact"
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref rCodeBuild
+                PrimarySource: !Sub "${pAppName}_AssetScript"
+              RunOrder: 1
+
+  rCodePipelineNotification:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Properties:
+      Name: !Sub "${pAppName}-${pRepo}-${pBranch}"
+      DetailType: BASIC
+      # List at: https://docs.aws.amazon.com/dtconsole/latest/userguide/concepts.html#events-ref-pipeline
+      EventTypeIds:
+        - codepipeline-pipeline-pipeline-execution-started
+        - codepipeline-pipeline-pipeline-execution-succeeded
+      Resource: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipeline}"
+      Targets:
+        - TargetType: SNS
+          TargetAddress: !Ref pTopicArn
+      Tags:
+        Application: !Ref pAppName
+        map-migrated: !Ref pMapTag
+
+  rCodePipelineFailedNotification:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Properties:
+      Name: !Sub "${pAppName}-${pRepo}-${pBranch}-err"
+      DetailType: FULL
+      # List at: https://docs.aws.amazon.com/dtconsole/latest/userguide/concepts.html#events-ref-pipeline
+      EventTypeIds:
+        - codepipeline-pipeline-pipeline-execution-canceled
+        - codepipeline-pipeline-pipeline-execution-failed
+      Resource: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipeline}"
+      Targets:
+        - TargetType: SNS
+          TargetAddress: !Ref pTopicFailedArn
+      Tags:
+        Application: !Ref pAppName
+        map-migrated: !Ref pMapTag

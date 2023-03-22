@@ -1,0 +1,16 @@
+{
+  "name": "lambda_dependencies",
+  "version": "1.0.0",
+  "description": "dependencies",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "jszip": "^3.10.0",
+    "nodemailer": "^6.8.0",
+    "unzipper": "^0.10.11"
+  }
+}

@@ -1,0 +1,531 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: "AWS::Serverless-2016-10-31"
+Description: Shared account resources to support CICD pipelinelins
+
+Parameters:
+  pAppName:
+    Type: String
+    Description: Small descriptive name of the application for prefixes, resource names, and tagging values.  Lower case only.
+    Default: otc
+  pDevAccountId:
+    Type: String
+    Default: 232137109144
+    Description: AWS Account Id for the Dev account.
+    AllowedPattern: "[0-9]{12}"
+  # pQAAccountId:
+  #   Type: String
+  #   Default: 246338920281
+  #   Description: AWS Account Id for the QA account.
+  #   AllowedPattern: "[0-9]{12}"
+  # pPreProdAccountId:
+  #   Type: String
+  #   Default: 615828586605
+  #   Description: AWS Account Id for the PreProduction account.
+  #   AllowedPattern: "[0-9]{12}"
+  # pProdAccountId:
+  #   Type: String
+  #   Default: 667975846098
+  #   Description: AWS Account Id for the Production account.
+  #   AllowedPattern: "[0-9]{12}"
+
+  pMapTag:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The map migration server tag value
+    Default: /map/server
+  pGitHubConnection:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The Arn for the GitHub/Pipeline connection resource
+    Default: /github/connection
+
+Resources:
+  rEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: ["kms:*"]
+            Resource: "*"
+          - Sid: SharedAccountRoles
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt rCodePipelineRole.Arn
+                - !GetAtt rCodeBuildRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: DevAccountRoles
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:${AWS::Partition}:iam::${pDevAccountId}:root"
+                - !Sub "arn:${AWS::Partition}:iam::${pDevAccountId}:role/${pAppName}-cross-account-role"
+                - !Sub "arn:${AWS::Partition}:iam::${pDevAccountId}:role/${pAppName}-codedeploy-role"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${pAppName}/pipeline-encryption-key"
+      TargetKeyId: !Ref rEncryptionKey
+
+  rPipelineTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${pAppName}-pipeline-api"
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rPipelineTopicFailed:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${pAppName}-pipeline-api-failed"
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rPipelineTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref rPipelineTopic
+        - !Ref rPipelineTopicFailed
+      PolicyDocument:
+        Statement:
+          - Sid: AllowPipelineNotification
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Ref rPipelineTopic
+            Principal:
+              Service:
+                - codestar-notifications.amazonaws.com
+          - Sid: AllowPipelineNotificationFailed
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Ref rPipelineTopicFailed
+            Principal:
+              Service:
+                - codestar-notifications.amazonaws.com
+
+  rPipelineQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sqs-pipeline
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt rPipelineQueueDlq.Arn
+        maxReceiveCount: 5
+
+  rPipelineQueueDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: sqs-pipeline-dlq
+      VisibilityTimeout: 300
+
+  rPipelineQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref rPipelineQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt rPipelineQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - arn:aws:sns:us-west-2:969702943927:otc-pipeline-api
+                  - arn:aws:sns:us-west-2:969702943927:otc-pipeline-api-failed
+
+  rPipelineTopicSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      Endpoint: !GetAtt rPipelineQueue.Arn
+      TopicArn: !Ref rPipelineTopic
+
+  rPipelineTopicFailedSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      Endpoint: !GetAtt rPipelineQueue.Arn
+      TopicArn: !Ref rPipelineTopicFailed
+
+  rPipelineQueueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src
+      Handler: queue-handler.handler
+      Role: !GetAtt rPipelineLambdaRole.Arn
+      Description: Process API Requests from the SQS Queue
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Runtime: nodejs16.x
+      Timeout: 10
+      Layers:
+        - !Ref rLambdaDepLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-04845238d34d40992
+        SubnetIds:
+          - subnet-0ed05aefa8d9e0181
+          - subnet-03d9bfb2d3dc29359
+      Events:
+        SQSHandle:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt rPipelineQueue.Arn
+            BatchSize: 10
+
+  rPipelineQueueLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${rPipelineQueueFunction}"
+      RetentionInDays: 90
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rArtifactPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref rCodePipelineRole
+        - !Ref rCodeBuildRole
+      PolicyName: ArtifactPolicy
+      PolicyDocument:
+        Statement:
+        - Action: ["s3:*"]
+          Resource:
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}"
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*"
+          Effect: Allow
+        - Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:GenerateDataKey
+          - kms:DescribeKey
+          Resource: "*"
+          Effect: Allow
+          Condition:
+            StringLike:
+              "kms:RequestAlias": !Sub "alias/${pAppName}/pipeline-encryption-key"
+        - Action: "codestar-connections:UseConnection"
+          Resource:
+            - !Ref pGitHubConnection
+          Effect: Allow
+
+  rCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${pAppName}-codepipeline-role"
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+          Action: sts:AssumeRole
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rCodePipelinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref rCodePipelineRole
+      PolicyName: CodePipelinePolicy
+      PolicyDocument:
+        Statement:
+        - Action:
+          - "codebuild:StartBuild"
+          - "codebuild:BatchGetBuilds"
+          Resource: !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${pAppName}*"
+          Effect: Allow
+        - Action:   # enable passing a role to its action workers (CodeBuild projects)
+          - "iam:PassRole"
+          - "iam:ListRoles"
+          Resource: "*"
+          Effect: Allow
+        - Action: ["sts:AssumeRole"]   # enable assuming a role its action workers (like CodeDeploy or CloudFormation) are executed under
+          Resource:
+            - !Sub "arn:${AWS::Partition}:iam::${pDevAccountId}:role/${pAppName}-*"
+            # - !Sub "arn:aws:iam::${pTestAccountId}:role/${pAppName}-*"
+            # - !Sub "arn:aws:iam::${pStageAccountId}:role/${pAppName}-*"
+            # - !Sub "arn:aws:iam::${pProdAccountId}:role/${pAppName}-*"
+          Effect: Allow
+        - Action:
+          - "s3:*"
+          Resource:
+          - "arn:aws:s3:::969702943927-codebuild"
+          - "arn:aws:s3:::969702943927-codebuild/*"
+          Effect: Allow
+        - Action:
+          - lambda:ListFunctions
+          - lambda:InvokeFunction
+          Resource: !GetAtt rPipelineNotification.Arn
+          Effect: Allow
+        - Action:
+          - "ec2:DescribeVpcs"
+          - "ec2:DescribeSubnets"
+          - "ec2:DescribeSecurityGroups"
+          - "ec2:DescribeNetworkInterfaces"
+          - "ec2:CreateNetworkInterface"
+          - "ec2:CreateNetworkInterfacePermission"
+          - "ec2:DeleteNetworkInterface"
+          - "ec2:DescribeDhcpOptions"
+          Resource: "*"
+          Effect: Allow
+
+  rCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${pAppName}-codebuild-role"
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rCodeBuildPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref rCodeBuildRole
+      PolicyName: CodeBuildPolicy
+      PolicyDocument:
+        Statement:
+        - Action:
+          - "logs:CreateLogStream"
+          - "logs:PutLogEvents"
+          - "logs:CreateLogGroup"
+          Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${pAppName}-*"
+          Effect: Allow
+        - Action:
+          - "codebuild:*"
+          Resource: "*"
+          Effect: Allow
+        - Sid: LambdaVpcPermissions
+          Effect: Allow
+          Action:
+          - "ec2:DescribeVpcs"
+          - "ec2:DescribeSubnets"
+          - "ec2:DescribeSecurityGroups"
+          - "ec2:DescribeNetworkInterfaces"
+          - "ec2:CreateNetworkInterface"
+          - "ec2:CreateNetworkInterfacePermission"
+          - "ec2:DeleteNetworkInterface"
+          - "ec2:DescribeDhcpOptions"
+          Resource:
+          - "*"
+
+  rPipelineLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${pAppName}-pipelambda-role"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rPipelineLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+      - !Ref rPipelineLambdaRole
+      PolicyName: PipelineLambdaPolicy
+      PolicyDocument:
+        Statement:
+        - Action:
+          - logs:*
+          Resource: "arn:aws:logs:*:*:*"
+          Effect: Allow
+        - Action:
+          - codepipeline:PutJobSuccessResult
+          - codepipeline:PutJobFailureResult
+          Resource: "*"
+          Effect: Allow
+        - Action:
+          - s3:*
+          Resource:
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}"
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*"
+          Effect: Allow
+        - Action:
+          - kms:Decrypt
+          - kms:GenerateDataKey
+          Resource:
+          - "*"
+          Effect: Allow
+        - Action:
+          - ses:SendEmail
+          Resource:
+          - "*"
+          Effect: Allow
+        - Action:
+          - codepipeline:ListActionExecutions
+          Resource:
+          - "*"
+          Effect: Allow
+        - Sid: LambdaVpcPermissions
+          Effect: Allow
+          Action:
+          - "autoscaling:CompleteLifecycleAction"
+          - "ec2:CreateNetworkInterface"
+          - "ec2:DescribeInstances"
+          - "ec2:DescribeNetworkInterfaces"
+          - "ec2:DeleteNetworkInterface"
+          - "ec2:AttachNetworkInterface"
+          Resource:
+          - "*"
+
+  rLambdaDepLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}_CoreDepLayer
+      Description: Lambda Layer for project dependency libraries
+      ContentUri: dependencies/
+      CompatibleRuntimes:
+        - nodejs12.x
+        - nodejs14.x
+      RetentionPolicy: Delete
+
+  rPipelineNotification:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src
+      Handler: pipeline-handler.handler
+      Role: !GetAtt rPipelineLambdaRole.Arn
+      MemorySize: 128
+      Timeout: 10
+      Runtime: nodejs14.x
+      Layers:
+        - !Ref rLambdaDepLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-04845238d34d40992
+        SubnetIds:
+          - subnet-0ed05aefa8d9e0181
+          - subnet-03d9bfb2d3dc29359
+
+  rS3ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::AccountId}-pipeline-artifact
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  rS3ArtifactPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref rS3ArtifactBucket
+      PolicyDocument:
+        Statement:
+        - Sid: SharedAccountRoles
+          Action: ["s3:*"]
+          Effect: Allow
+          Resource:
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}"
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*"
+          - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/OTCPipelineAPI-rLambdaRole-*"
+          Principal:
+            AWS:
+            - !GetAtt rCodePipelineRole.Arn
+            - !GetAtt rCodeBuildRole.Arn
+        - Sid: DevAccountRoles
+          Action: ["s3:*"]
+          Effect: Allow
+          Resource:
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}"
+          - !Sub "arn:${AWS::Partition}:s3:::${rS3ArtifactBucket}/*"
+          Principal:
+            AWS:
+            - !Sub "arn:${AWS::Partition}:iam::${pDevAccountId}:role/${pAppName}-cross-account-role"
+            - !Sub "arn:${AWS::Partition}:iam::${pDevAccountId}:role/${pAppName}-codedeploy-role"
+
+  # Output SSM Parameters
+  rKmsArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${pAppName}/kms/key"
+      Type: String
+      Value: !GetAtt rEncryptionKey.Arn
+      Tags:
+        map-migrated: !Ref pMapTag
+
+  rS3ArtifactBucketParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${pAppName}/s3/artifact"
+      Type: String
+      Value: !Ref rS3ArtifactBucket
+      Tags:
+        map-migrated: !Ref pMapTag
+
+  rSnsApiPipelineParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${pAppName}/sns/pipeline"
+      Type: String
+      Value: !Ref rPipelineTopic
+      Tags:
+        map-migrated: !Ref pMapTag
+
+  rSnsApiFailedPipelineParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${pAppName}/sns/pipelineFailed"
+      Type: String
+      Value: !Ref rPipelineTopicFailed
+      Tags:
+        map-migrated: !Ref pMapTag

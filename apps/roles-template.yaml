@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Building CICD support roles and resources in the application account.
+
+Parameters:
+  pAppName:
+    Type: String
+    Description: Small descriptive name of the application for prefixes, resource names, and tagging values.  Lower case only.
+    Default: otc
+  pSharedAccount:
+    Type: String
+    Description: The AWS Account Id of the Shared account where the Pipelines will start.
+    Default: 969702943927
+
+  # pKmsKey:
+  #   Type: String
+  #   Description: KMS Key ARN from Shared Account
+  #   Default: arn:aws:kms:
+
+  pMapTag:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: The map migration server tag value
+    Default: /map/server
+
+Resources:
+  rCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${pAppName}-cross-account-role"
+      Description: A cross account role that can be assumed from the shared account, and then pass through for build and deployment activities.
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub "arn:aws:iam::${pSharedAccount}:root"
+          Action: sts:AssumeRole
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
+
+  rCrossAccountPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref rCrossAccountRole
+      PolicyName: CrossAccountPolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRole"
+            Resource:
+              - !GetAtt rCodeDeployRole.Arn
+          # - Effect: Allow
+          #   Action: [ "kms:Decrypt", "kms:Encrypt" ]
+          #   Resource:
+          #   - !Ref pKmsKey
+
+  rCodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${pAppName}-codedeploy-role"
+      Path: '/'
+      Description: A role that can be assumed from the shared account during deployments.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'codedeploy.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole'
+      Tags:
+        - Key: map-migrated
+          Value: !Ref pMapTag
